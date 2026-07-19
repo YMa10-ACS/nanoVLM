@@ -1,7 +1,13 @@
 import math
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def add_timing(timing_metrics, metric_name, elapsed):
+    if timing_metrics is not None:
+        timing_metrics[metric_name] = timing_metrics.get(metric_name, 0.0) + elapsed
 
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L69
 class RMSNorm(nn.Module):
@@ -204,7 +210,7 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         if not self.sdpa:
             print("Warning: scaled dot product attention not available, using standard attention in LM.")
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask=None, block_kv_cache=None) -> tuple[torch.Tensor, dict]:
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask=None, block_kv_cache=None, timing_metrics=None) -> tuple[torch.Tensor, dict]:
         """
         Forward pass for grouped query attention.
 
@@ -228,23 +234,29 @@ class LanguageModelGroupedQueryAttention(nn.Module):
 
         B, T_curr, C = x.size() # T_curr is the sequence length of the current input x
 
+        qkv_start = time.perf_counter()
         q_curr = self.q_proj(x).view(B, T_curr, self.n_heads, self.head_dim).transpose(1, 2)  # (B, n_heads, T_curr, head_dim)
         k_curr = self.k_proj(x).view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
         v_curr = self.v_proj(x).view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
+        add_timing(timing_metrics, "cloud_decoder_qkv_proj_time", time.perf_counter() - qkv_start)
 
         # Apply rotary embeddings to the current q and k
+        rotary_start = time.perf_counter()
         q, k_rotated = apply_rotary_pos_embd(q_curr, k_curr, cos, sin)
+        add_timing(timing_metrics, "cloud_decoder_rotary_time", time.perf_counter() - rotary_start)
 
         # Check if we can use cached keys and values
         if not is_prefill and block_kv_cache['key'] is not None:
             # Concatenate with cached K, V
             # k_rotated and v_curr are for the new token(s)
+            kv_cat_start = time.perf_counter()
             k = block_kv_cache['key']
             v = block_kv_cache['value']
             k = torch.cat([k, k_rotated], dim=2)
             v = torch.cat([v, v_curr], dim=2)
             block_kv_cache['key'] = k
             block_kv_cache['value'] = v
+            add_timing(timing_metrics, "cloud_decoder_kv_cat_time", time.perf_counter() - kv_cat_start)
         else:
             # No cache, this is the first pass (prefill)
             k = k_rotated
@@ -252,8 +264,10 @@ class LanguageModelGroupedQueryAttention(nn.Module):
             block_kv_cache = {'key': k, 'value': v}
 
         # Repeat K, V for Grouped Query Attention
+        kv_repeat_start = time.perf_counter()
         k_exp = k.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)
         v_exp = v.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)
+        add_timing(timing_metrics, "cloud_decoder_kv_repeat_time", time.perf_counter() - kv_repeat_start)
         
         T_kv = k_exp.size(2) # Total sequence length of keys/values
 
@@ -261,12 +275,15 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
         additive_attn_mask = None
         if attention_mask is not None:
+            mask_start = time.perf_counter()
             # The current `attention_mask` parameter is assumed to be `[B, total_sequence_length_kv]`
             # Let's make it `[B, 1, 1, T_kv]` for SDPA.
             mask_for_keys = attention_mask[:, :T_kv] # Ensure mask matches key length [B, T_kv]
             additive_attn_mask = (1.0 - mask_for_keys.unsqueeze(1).unsqueeze(2).float()) * torch.finfo(q.dtype).min
             # This additive_attn_mask shape is [B, 1, 1, T_kv]
+            add_timing(timing_metrics, "cloud_decoder_attention_mask_time", time.perf_counter() - mask_start)
 
+        attention_start = time.perf_counter()
         if self.sdpa and x.device.type != 'mps':
             # During decode, no additional masking needed as [1, T_kv] is naturally causal
             is_causal = (T_curr == T_kv and T_curr > 1)
@@ -291,10 +308,13 @@ class LanguageModelGroupedQueryAttention(nn.Module):
             attn = F.softmax(attn, dim=-1)
             attn = self.attn_dropout(attn)
             y = attn @ v_exp
+        add_timing(timing_metrics, "cloud_decoder_attention_core_time", time.perf_counter() - attention_start)
             
+        out_proj_start = time.perf_counter()
         y = y.transpose(1, 2).contiguous().view(B, T_curr, C)
         y = self.out_proj(y)
         y = self.resid_dropout(y)
+        add_timing(timing_metrics, "cloud_decoder_out_proj_time", time.perf_counter() - out_proj_start)
 
         return y, block_kv_cache
 
@@ -356,7 +376,7 @@ class LanguageModelBlock(nn.Module):
         self.norm1 = RMSNorm(cfg) # Input Norm
         self.norm2 = RMSNorm(cfg) # Post Attention Norm
     
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask: torch.Tensor=None, block_kv_cache: dict=None):
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask: torch.Tensor=None, block_kv_cache: dict=None, timing_metrics=None):
         """
         Forward pass of the Transformer block.
 
@@ -375,13 +395,19 @@ class LanguageModelBlock(nn.Module):
                 and the updated key-value cache dictionary.
         """
         res = x
+        norm1_start = time.perf_counter()
         x = self.norm1(x)
-        x, block_kv_cache = self.attn(x, cos, sin, attention_mask, block_kv_cache)
+        add_timing(timing_metrics, "cloud_decoder_norm_time", time.perf_counter() - norm1_start)
+        x, block_kv_cache = self.attn(x, cos, sin, attention_mask, block_kv_cache, timing_metrics)
         x = res + x
 
         res = x
+        norm2_start = time.perf_counter()
         x = self.norm2(x)
+        add_timing(timing_metrics, "cloud_decoder_norm_time", time.perf_counter() - norm2_start)
+        mlp_start = time.perf_counter()
         x = self.mlp(x)
+        add_timing(timing_metrics, "cloud_decoder_mlp_time", time.perf_counter() - mlp_start)
         x = res + x
 
         return x, block_kv_cache
@@ -416,7 +442,7 @@ class LanguageModel(nn.Module):
         elif isinstance(module, RMSNorm):
             module.weight.data.fill_(1.0)
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor=None, kv_cache: list[dict]=None, start_pos: int=0):
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor=None, kv_cache: list[dict]=None, start_pos: int=0, timing_metrics=None):
         """
         Performs a forward pass through the language model.
 
@@ -461,21 +487,27 @@ class LanguageModel(nn.Module):
         B, T_curr, _ = x.size()
         
         # Create position_ids for the current sequence based on start_pos
+        rotary_embd_start = time.perf_counter()
         current_position_ids = torch.arange(start_pos, start_pos + T_curr, device=x.device).unsqueeze(0).expand(B, -1)
         cos, sin = self.rotary_embd(current_position_ids) # Get rotary position embeddings for current tokens
+        add_timing(timing_metrics, "cloud_decoder_rotary_embd_time", time.perf_counter() - rotary_embd_start)
 
         # Initialize new KV cache if none provided
         if kv_cache is None:
             kv_cache = [None] * len(self.blocks)
 
         for i, block in enumerate(self.blocks):
-            x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i])
+            x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i], timing_metrics)
 
+        final_norm_start = time.perf_counter()
         x = self.norm(x)
+        add_timing(timing_metrics, "cloud_decoder_norm_time", time.perf_counter() - final_norm_start)
 
         # Compute logits if we are using tokens, otherwise stay in the embedding space
         if self.lm_use_tokens: 
+            lm_head_start = time.perf_counter()
             x = self.head(x) 
+            add_timing(timing_metrics, "cloud_decoder_lm_head_time", time.perf_counter() - lm_head_start)
 
         return x, kv_cache
 
