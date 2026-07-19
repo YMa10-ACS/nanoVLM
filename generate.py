@@ -77,7 +77,9 @@ def main():
 
     messages = [{"role": "user", "content": image_string + args.prompt}]
     encoded_prompt = tokenizer.apply_chat_template([messages], tokenize=True, add_generation_prompt=True)
-    tokens = torch.tensor(encoded_prompt).to(device)
+    if isinstance(encoded_prompt, dict):
+        encoded_prompt = encoded_prompt["input_ids"]
+    tokens = torch.as_tensor(encoded_prompt, dtype=torch.long, device=device)
     img_t = processed_image.to(device)
 
     print("\nInput:\n ", args.prompt, "\n\nOutput:")
